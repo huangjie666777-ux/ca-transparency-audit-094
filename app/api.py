@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from . import policy
+from .acme_api import create_acme_router
+from .acme_service import AcmeService
 from .service import CAService
 from .storage import (
     CertificateNotFound,
@@ -19,7 +21,7 @@ TEXT_PEM = "application/x-pem-file"
 
 class IssueRequest(BaseModel):
     csr: str = Field(description="PEM-encoded PKCS#10 certificate request")
-    days: int
+    days: StrictInt
     idempotency_key: str
 
 
@@ -27,8 +29,9 @@ class RevokeRequest(BaseModel):
     reason: str
 
 
-def create_app(service: CAService) -> FastAPI:
+def create_app(service: CAService, acme_service: AcmeService) -> FastAPI:
     app = FastAPI(title="Local Test CA")
+    app.include_router(create_acme_router(acme_service))
 
     @app.exception_handler(policy.PolicyError)
     async def policy_error_handler(request: Request, exc: policy.PolicyError):
