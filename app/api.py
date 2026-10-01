@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, StrictInt
 from . import policy
 from .acme_api import create_acme_router
 from .acme_service import AcmeService
+from .audit_api import create_audit_router
+from .audit_store import AuditLog
 from .service import CAService
 from .storage import (
     CertificateNotFound,
@@ -29,9 +31,15 @@ class RevokeRequest(BaseModel):
     reason: str
 
 
-def create_app(service: CAService, acme_service: AcmeService) -> FastAPI:
+def create_app(
+    service: CAService,
+    acme_service: AcmeService,
+    audit: AuditLog | None = None,
+) -> FastAPI:
     app = FastAPI(title="Local Test CA")
     app.include_router(create_acme_router(acme_service))
+    if audit is not None:
+        app.include_router(create_audit_router(audit))
 
     @app.exception_handler(policy.PolicyError)
     async def policy_error_handler(request: Request, exc: policy.PolicyError):

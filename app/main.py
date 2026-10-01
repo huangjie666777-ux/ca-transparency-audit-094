@@ -13,6 +13,8 @@ from .acme_challenge import Http01Config
 from .acme_service import AcmeService
 from .acme_store import ACMEStore
 from .api import create_app
+from .audit_key import LogKeyError
+from .audit_store import AuditError, AuditLog
 from .ca import CAError, load_or_create_ca
 from .service import CAService
 from .storage import CAStore
@@ -35,6 +37,20 @@ except CAError:
 _store = CAStore(DATA_DIR)
 _acme_store = ACMEStore(DATA_DIR)
 _acme_store.ensure_schema()
+
+# Build/verify the transparency log before issuance is served. A one-time
+# backfill of any pre-existing certificates happens here (ascending numeric
+# serial, single transaction); a missing/mismatched log key or a failed
+# migration is a fatal startup error, never silently skipped.
+_audit = AuditLog(DATA_DIR)
+try:
+    _audit.bootstrap()
+except (AuditError, LogKeyError):
+    raise
+# From now on every successful issuance appends its leaf atomically.
+_store.audit = _audit
+_acme_store.audit = _audit
+
 service = CAService(_ca, _store)
 acme_service = AcmeService(
     ca=_ca,
@@ -47,4 +63,4 @@ acme_service = AcmeService(
 if _store.get_current_crl() is None:
     service.publish_crl()
 
-app = create_app(service, acme_service)
+app = create_app(service, acme_service, _audit)

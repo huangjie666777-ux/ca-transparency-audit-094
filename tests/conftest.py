@@ -13,6 +13,7 @@ from app.api import create_app
 from app.acme_challenge import Http01Config
 from app.acme_service import AcmeService
 from app.acme_store import ACMEStore
+from app.audit_store import AuditLog
 from app.ca import CertificateAuthority, load_or_create_ca
 from app.service import CAService
 from app.storage import CAStore
@@ -67,6 +68,10 @@ def env(tmp_path):
     store = CAStore(str(data_dir))
     acme_store = ACMEStore(str(data_dir))
     acme_store.ensure_schema()
+    audit = AuditLog(str(data_dir))
+    audit.bootstrap()
+    store.audit = audit
+    acme_store.audit = audit
     service = CAService(ca, store)
     service.publish_crl()  # initial empty CRL
     acme_service = AcmeService(
@@ -75,13 +80,14 @@ def env(tmp_path):
         cert_store=store,
         http01_config=Http01Config(port=80, timeout=5.0, max_bytes=8192),
     )
-    app = create_app(service, acme_service)
+    app = create_app(service, acme_service, audit)
     with TestClient(app) as client:
         yield type("Env", (), {
             "data_dir": str(data_dir),
             "ca": ca,
             "store": store,
             "acme_store": acme_store,
+            "audit": audit,
             "service": service,
             "acme": acme_service,
             "client": client,

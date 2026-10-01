@@ -109,6 +109,9 @@ class CAStore:
     def __init__(self, data_dir: str):
         self._db_path = os.path.join(data_dir, DB_FILE)
         self._lock = threading.RLock()
+        # Set after AuditLog.bootstrap(); when present a successful issuance
+        # appends a log leaf inside this same transaction.
+        self.audit: object | None = None
 
     def _ensure_dir(self) -> None:
         os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
@@ -236,6 +239,13 @@ class CAStore:
                             days,
                         ),
                     )
+                    # Transparency leaf: same transaction as the certificate
+                    # and idempotency row, so a failure leaves neither. A
+                    # replayed request returned above and adds no leaf.
+                    if self.audit is not None:
+                        self.audit.append_within_txn(
+                            conn, serial_hex, cert_pem
+                        )
                     conn.execute("COMMIT")
                     row = conn.execute(
                         "SELECT * FROM certificates WHERE serial_hex = ?",

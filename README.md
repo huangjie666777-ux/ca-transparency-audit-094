@@ -17,9 +17,11 @@ LOCAL_CA_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app \
 ```
 
 - 数据目录为空时，启动会自动生成 4096 位 RSA 自签根 CA（有效期 10 年）。
-- 重启时复用同一 CA 与 SQLite 记录。
+- 重启时复用同一 CA、SQLite 记录与透明度日志（索引、历史根、日志身份）。
 - 已有数据库但 CA 私钥/证书缺失、只存在其一、密钥与证书不匹配，或证书与
   数据库绑定的指纹不一致时，服务拒绝启动（`app.ca.CAError`），不会静默换 CA。
+- 数据库里已有透明度日志但 `log_key.pem` 缺失或与库中 `log_id` 不匹配时，
+  同样拒绝启动（`app.audit_key.LogKeyError`）。
 
 ### ACME / http-01 相关配置
 
@@ -36,7 +38,12 @@ LOCAL_CA_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app \
 - `ca_key.pem`：CA 私钥，PKCS#8 PEM、**无口令加密**，文件权限 `0600`，
   仅存本机，不提供任何下载接口；请只在隔离的本机联调环境使用。
 - `ca_cert.pem`：CA 证书，权限 `0644`，可通过接口下载。
-- `ca.sqlite3`：证书记录、幂等键、吊销状态与 CRL 编号（WAL 模式）。
+- `log_key.pem`：审计日志树头签名用的 **Ed25519** 私钥，权限 `0600`，
+  与 CA 密钥相互独立，无下载接口。
+- `log_pubkey.raw`：对应的 32 字节原始 Ed25519 公钥，权限 `0644`，供带外
+  预置为核验信任锚。
+- `ca.sqlite3`：证书记录、幂等键、吊销状态、CRL 编号、ACME 表与透明度
+  审计日志（`audit_*` 表，WAL 模式）。
 
 ## 签发策略
 
@@ -123,6 +130,91 @@ LOCAL_CA_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app \
 错误返回 `application/problem+json`
 （`{"type": "urn:ietf:params:acme:error:<code>", ...}`），并带新的
 `Replay-Nonce`。订单状态：`pending → ready → valid`（或 `invalid`）。
+
+## 透明度审计日志（RFC 6962 子集）
+
+服务另维护一条**只追加**的证书透明度审计日志，供运维核对“哪些证书入账”
+与“历史是否被改写”。纯后端、无 SCT；旧签发与 ACME 成功签发都会把**完整
+证书 DER**作为叶子追加到同一个 SQLite（`audit_*` 表）。
+
+### 规则与边界
+
+- 叶子索引从 **0** 连续递增；证书、申领关联（ACME 订单）与日志叶子在**同一
+  事务**原子提交，任何一步失败整体回滚，不留单边记录。
+- 幂等重放（旧接口同幂等键、ACME 同订单同 CSR）**不新增叶子**；并发签发由
+  写事务串行化，不重复、不跳号。
+- **吊销不改日志**：不删除叶子、不改历史根，只更新证书状态。
+- 哈希采用 RFC 6962 §2.1 的 SHA-256 规则：叶子 `SHA256(0x00 || DER)`、
+  内部节点 `SHA256(0x01 || left || right)`、空树 `SHA256("")`。
+- Merkle 节点**持久化**到 `audit_nodes`；追加一片叶子只物化其晋升路径上的
+  O(log n) 个节点，根/证明只从持久化节点读取，支持非满树，**不会重算全库**，
+  也不会用“返回全部叶子”代替证明。
+- 每次提交都为该树大小保存一个**签名树头**（`audit_sth`），因此每个历史
+  大小都有可验证的根。
+
+### 树头签名与日志身份
+
+- 树头由一把**独立持久化的 Ed25519 密钥**签名（`log_key.pem`，权限 `0600`，
+  与 4096 位 RSA CA 密钥分离）；原始 32 字节公钥另写 `log_pubkey.raw`
+  （`0644`）供带外预置/固定。
+- 日志身份 `log_id = SHA256(Ed25519 公钥)`。树头签名覆盖
+  `域名分隔串 || log_id || 大端8字节 tree_size || root_hash`，把身份、大小
+  和根绑定在一起。
+- 重启保留索引、全部历史根与日志身份，只做校验不重建。**库里已有日志而
+  `log_key.pem` 缺失、或密钥与库中身份不匹配时，拒绝启动**
+  （`app.audit_key.LogKeyError` / `app.audit_store.AuditError`）。
+
+### 旧库一次性迁移
+
+首次以新版本启动、库中尚无日志时，在开放签发前把 `certificates` 中的旧证书
+按**序列号数值升序**在**单事务**内一次性建入日志（空库则落一个签名空树头）。
+迁移任一步失败整批回滚，不产生半成品日志；此后重启不再迁移。
+
+### 审计接口
+
+| 方法/路径 | 说明 |
+| --- | --- |
+| `GET /audit/v1/key` | 日志身份、算法与原始 Ed25519 公钥（base64url） |
+| `GET /audit/v1/head?tree_size=N` | 最新（省略 N）或指定历史大小的签名树头 |
+| `GET /audit/v1/inclusion/{index}?tree_size=N` | 指定叶子的包含证明 + 证书 DER + 该快照树头 |
+| `GET /audit/v1/consistency?first=a&second=b` | 两个树大小之间的一致性证明（含两端树头） |
+
+二进制值（根、节点、签名、公钥、证书 DER、log_id）一律为**无填充
+base64url**。包含证明的叶子、路径与根读自**同一提交快照**。越界/未提交的
+树大小、叶子索引返回 `404`，非法大小区间返回 `400`。
+
+### 独立核验
+
+`app/audit_verify.py` 提供与服务端隔离的核验逻辑（不导入数据库或签名代码），
+`scripts/audit_demo.py` 是可运行演示。核验**仅凭**：
+
+1. 带外预置的固定公钥（`data/log_pubkey.raw`，**绝不信任响应里自带的公钥**）；
+2. 证书 DER、签名树头与证明。
+
+可独立验证：树头签名与 `log_id`、证书包含性、两个树头的历史前缀一致性；
+对篡改的叶子/证明/签名、非法大小、多余节点一律拒绝。
+
+```sh
+# 服务运行后（默认数据目录 ./data）
+.venv/bin/python scripts/audit_demo.py \
+  --base http://127.0.0.1:8000 \
+  --pinned-key ./data/log_pubkey.raw
+```
+
+### curl 速查
+
+```sh
+curl -s http://127.0.0.1:8000/audit/v1/key
+curl -s http://127.0.0.1:8000/audit/v1/head
+curl -s 'http://127.0.0.1:8000/audit/v1/head?tree_size=0'
+curl -s http://127.0.0.1:8000/audit/v1/inclusion/0
+curl -s 'http://127.0.0.1:8000/audit/v1/consistency?first=1&second=3'
+```
+
+## 附带修复
+
+http-01 挑战响应体若不是合法 UTF-8（无法等于纯 ASCII 的 key authorization），
+现在明确判定为挑战失败（`400 incorrectResponse`），不再抛未处理异常导致 `500`。
 
 ## curl 演示
 
@@ -299,4 +391,12 @@ ACME 测试（`tests/test_acme.py`）额外覆盖：目录/nonce、账号注册�
 订单域名策略、http-01 成功/错误 body/重定向/超大响应（本机起真实 HTTP
 服务校验 `Host` 头与路径）、未验证与过期拒签、CSR SAN 匹配、同订单同 CSR
 并发只签一张、不同 CSR 冲突、签发失败不留孤证、重启后继续，以及旧接口
-`days` 拒绝布尔/字符串和 ACME 证书与旧接口/CRL 的互通。
+`days` 拒绝布尔/字符串和 ACME 证书与旧接口/CRL 的互通；另覆盖非 UTF-8
+挑战响应返回 `400` 而非 `500`，以及 ACME 证书恰好入账一片且失败不留日志。
+
+透明度审计测试（`tests/test_audit.py`）覆盖：空树/叶/节点哈希前缀、对多种
+非满树大小的包含与一致性证明及独立参考实现互验、篡改叶子/证明/签名/大小与
+多余/非法节点被拒、旧签发与并发签发索引连续无重无跳、幂等重放不增叶、吊销
+不改历史、最新与历史树头、同快照包含与一致性接口、越界明确拒绝、旧库按
+序列号数值升序一次性迁移与失败整批回滚、重启保留索引/历史根/身份，以及日志
+密钥缺失或不匹配拒绝启动。

@@ -148,6 +148,9 @@ class ACMEStore:
     def __init__(self, data_dir: str):
         self._db_path = os.path.join(data_dir, "ca.sqlite3")
         self._lock = threading.RLock()
+        # Wired after AuditLog.bootstrap(); a successful finalize appends a
+        # log leaf in the same transaction as cert + order link.
+        self.audit: object | None = None
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
@@ -478,6 +481,12 @@ class ACMEStore:
                         "cert_serial_hex = ?, updated_at = ? WHERE id = ?",
                         (STATUS_VALID, csr_der, serial_hex, now_iso, order_id),
                     )
+                    # Transparency leaf: same transaction as certificate +
+                    # order linkage; the replay branch above adds no leaf.
+                    if self.audit is not None:
+                        self.audit.append_within_txn(
+                            conn, serial_hex, cert_pem
+                        )
                     conn.execute("COMMIT")
                     final_order = self._row_to_order(
                         conn.execute(

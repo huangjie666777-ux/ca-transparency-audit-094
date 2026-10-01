@@ -378,6 +378,16 @@ def test_full_http01_flow_uses_host_header_and_path(
     # Chain includes the CA certificate after the leaf.
     assert env.ca.cert_pem.decode() in chain_pem.decode()
 
+    # The ACME-issued certificate was appended to the transparency audit log
+    # exactly once, and its leaf verifies.
+    from app import merkle as merkle_mod
+
+    assert env.audit.current_size() == 1
+    audit_der = env.audit.get_leaf(0, 1)[0]
+    assert audit_der == leaf.public_bytes(serialization.Encoding.DER)
+    path, _lh, root = env.audit.inclusion_proof(0, 1)
+    merkle_mod.verify_inclusion(0, 1, path, merkle_mod.hash_leaf(audit_der), root)
+
 
 def test_wrong_key_authorization_keeps_challenge_pending(
     env, challenge_server
@@ -421,6 +431,20 @@ def test_oversized_response_rejected(env, challenge_server):
     resp = client.solve_challenge(challenge_path)
     assert resp.status_code == 400
     assert "too large" in resp.json()["detail"]
+
+
+def test_non_utf8_response_rejected_not_500(env, challenge_server):
+    # A body that is not valid UTF-8 can never equal the ASCII key
+    # authorization; it must be a failed challenge (400), never a 500.
+    client = _registered(env)
+    _, authz_path, _ = _order_objects(client, "u.lab.test")
+    challenge = client.fetch_authz(authz_path).json()["challenges"][0]
+    challenge_path = "/" + challenge["url"].split("/", 3)[3]
+    challenge_server.payload = b"\xff\xfe\x00invalid"
+    resp = client.solve_challenge(challenge_path)
+    assert resp.status_code == 400
+    assert resp.json()["type"].endswith("incorrectResponse")
+    assert "UTF-8" in resp.json()["detail"]
 
 
 def test_challenge_payload_must_be_empty_object(env, challenge_server):
@@ -544,6 +568,10 @@ def test_no_orphan_certificate_when_signing_fails(
     try:
         assert conn.execute("SELECT COUNT(*) FROM certificates").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0] == 0
+        # The transparency leaf commits with the certificate: none remains.
+        assert conn.execute("SELECT COUNT(*) FROM audit_leaves").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM audit_sth WHERE tree_size > 0"
+                            ).fetchone()[0] == 0
         order_status = conn.execute(
             "SELECT status, cert_serial_hex FROM acme_orders"
         ).fetchone()
@@ -566,6 +594,7 @@ def test_restart_preserves_order_and_certificate(env, challenge_server, tmp_path
 
     # Full process restart: rebuild every component from the data directory.
     from app.api import create_app
+    from app.audit_store import AuditLog
     from app.ca import load_or_create_ca
     from app.acme_service import AcmeService
     from app.acme_store import ACMEStore
@@ -577,6 +606,10 @@ def test_restart_preserves_order_and_certificate(env, challenge_server, tmp_path
     store = CAStore(env.data_dir)
     acme_store = ACMEStore(env.data_dir)
     acme_store.ensure_schema()
+    audit = AuditLog(env.data_dir)
+    audit.bootstrap()
+    store.audit = audit
+    acme_store.audit = audit
     service = CAService(ca, store)
     acme_service = AcmeService(
         ca=ca,
@@ -584,7 +617,7 @@ def test_restart_preserves_order_and_certificate(env, challenge_server, tmp_path
         cert_store=store,
         http01_config=Http01Config(port=challenge_server.port, timeout=5, max_bytes=8192),
     )
-    app = create_app(service, acme_service)
+    app = create_app(service, acme_service, audit)
     with TestClient(app) as restarted_http:
         restarted = AcmeClient(
             http=restarted_http, account=client.account

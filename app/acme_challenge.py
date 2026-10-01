@@ -84,8 +84,12 @@ def verify_http_01(
         return ChallengeResult(False, f"challenge request failed: {exc}")
 
     # RFC 8555: trim trailing whitespace only; everything else must match
-    # byte for byte.
-    served = body.decode("utf-8", errors="strict").rstrip()
+    # byte for byte. A key authorization is pure ASCII, so a non-UTF-8 body
+    # can never match; report a failed challenge instead of a 500.
+    try:
+        served = body.decode("utf-8", errors="strict").rstrip()
+    except UnicodeDecodeError:
+        return ChallengeResult(False, "response body is not valid UTF-8")
     if served != key_authorization:
         return ChallengeResult(False, "key authorization mismatch")
     return ChallengeResult(True)
