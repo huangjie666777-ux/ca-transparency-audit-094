@@ -417,12 +417,15 @@ class ACMEStore:
         days: int,
         sign: SignCallback,
         now_iso: str,
+        log_store: object | None = None,
     ) -> tuple[OrderRecord, CertificateRecordShim]:
         """Finalize an order and issue its certificate in one transaction.
 
         Same order + same CSR replays the original certificate; same order
         with a different CSR raises :class:`OrderConflict`. A signing/insert
-        failure rolls the whole transaction back.
+        failure rolls the whole transaction back. When ``log_store`` is
+        given, the transparency log leaf is appended in the same
+        transaction.
         """
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -478,6 +481,12 @@ class ACMEStore:
                         "cert_serial_hex = ?, updated_at = ? WHERE id = ?",
                         (STATUS_VALID, csr_der, serial_hex, now_iso, order_id),
                     )
+                    if log_store is not None:
+                        from .log_store import pem_to_der
+
+                        log_store.append_certificate(
+                            conn, serial_hex, pem_to_der(cert_pem)
+                        )
                     conn.execute("COMMIT")
                     final_order = self._row_to_order(
                         conn.execute(

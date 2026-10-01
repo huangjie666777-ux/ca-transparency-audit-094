@@ -58,6 +58,7 @@ class AcmeService:
         store: ACMEStore,
         cert_store: CAStore,
         http01_config: Http01Config,
+        log_store: object | None = None,
         *,
         clock: Callable[[], dt.datetime] = _utcnow,
         nonce_ttl: dt.timedelta = NONCE_TTL,
@@ -68,6 +69,7 @@ class AcmeService:
         self._store = store
         self._cert_store = cert_store
         self._http01 = http01_config
+        self._log_store = log_store
         self._clock = clock
         self._nonce_ttl = nonce_ttl
         self._order_ttl = order_ttl
@@ -330,6 +332,7 @@ class AcmeService:
                 days=self._cert_days,
                 sign=sign,
                 now_iso=now.isoformat(),
+                log_store=self._log_store,
             )
         except OrderConflict as exc:
             raise AcmeError("orderAlreadyIssued", str(exc), 409) from exc

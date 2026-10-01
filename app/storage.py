@@ -176,6 +176,7 @@ class CAStore:
         csr_der: bytes,
         days: int,
         sign: SignCallback,
+        log_store: object | None = None,
     ) -> IssueResult:
         """Idempotently persist a certificate.
 
@@ -183,6 +184,8 @@ class CAStore:
         same key with different content raises IdempotencyConflict.
         A process-wide lock plus one transaction guarantees one record even
         under concurrent retries; a signing/insert failure leaves nothing.
+        When ``log_store`` is given, the transparency log leaf is appended
+        in the same transaction, so a failure rolls back both.
         """
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -236,6 +239,12 @@ class CAStore:
                             days,
                         ),
                     )
+                    if log_store is not None:
+                        from .log_store import pem_to_der
+
+                        log_store.append_certificate(
+                            conn, serial_hex, pem_to_der(cert_pem)
+                        )
                     conn.execute("COMMIT")
                     row = conn.execute(
                         "SELECT * FROM certificates WHERE serial_hex = ?",

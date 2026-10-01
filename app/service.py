@@ -33,9 +33,15 @@ def parse_csr(pem_bytes: bytes) -> x509.CertificateSigningRequest:
 
 
 class CAService:
-    def __init__(self, ca: CertificateAuthority, store: CAStore):
+    def __init__(
+        self,
+        ca: CertificateAuthority,
+        store: CAStore,
+        log_store: object | None = None,
+    ):
         self._ca = ca
         self._store = store
+        self._log_store = log_store
 
     @property
     def ca(self) -> CertificateAuthority:
@@ -81,6 +87,7 @@ class CAService:
             csr_der=csr_der,
             days=days,
             sign=sign,
+            log_store=self._log_store,
         )
         return result.record, result.replayed
 

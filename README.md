@@ -72,6 +72,64 @@ LOCAL_CA_DATA_DIR=./data .venv/bin/python -m uvicorn app.main:app \
 吊销不可撤回。CRL 由 CA 签名，包含全部吊销记录，`CRLNumber` 持久化递增，
 启动时即发布首份空 CRL。
 
+## 透明度审计日志（RFC 6962）
+
+签发（含传统签发与 ACME 签发）的证书 DER 会追加到一棵 **Merkle 树**日志，
+供运维核对入账与历史完整性。纯后端实现，无 SCT。
+
+### 格式与边界
+
+- 叶输入为**完整证书 DER**，叶哈希 = `SHA256(0x00 || DER)`。
+- 节点哈希 = `SHA256(0x01 || left || right)`；空树根 = `SHA256("")`。
+- 叶索引从 0 连续递增；证书、幂等关联与日志在**同一事务**提交，
+  失败不留单边记录。幂等重放不增叶，吊销不删历史，并发不跳号/重号。
+- 树节点持久化到 SQLite（`log_nodes`），追加只更新必要路径；支持非满树，
+  根与证明从存储节点计算，不重算全库、不返回全部叶子代替证明。
+- 树头绑定日志身份、大小与根，由**独立持久 Ed25519 密钥**签名
+  （`log_key.pem`，与 CA 的 RSA 密钥分离）。签名消息格式：
+  `HEAD_PREFIX || log_id(16 字节) || tree_size(8 字节大端) || root_hash(32 字节)`，
+  其中 `HEAD_PREFIX` 为 ASCII `ltca-transparency-log-head` 加一个零字节。
+- 证明读取在**同一快照事务**内完成；越界请求明确拒绝。
+
+### 启动迁移
+
+- 启动时若日志未初始化，对旧库证书按**序列号数值升序**一次性建日志，
+  再开放签发；迁移失败整批回滚。
+- 重启保留索引、历史根与日志身份。已有日志但签名密钥缺失或不匹配时
+  **拒绝启动**（`app.log_signing.LogKeyError`）。
+
+### 审计接口
+
+| 方法/路径 | 说明 |
+| --- | --- |
+| `GET /log/public-key` | 日志身份与 Ed25519 公钥（原始 base64url + PEM） |
+| `GET /log/head` | 最新签名树头 |
+| `GET /log/head/{size}` | 指定大小的历史签名树头 |
+| `GET /log/proof/inclusion/{index}?size={size}` | 包含证明（默认最新大小） |
+| `GET /log/proof/consistency?old={m}&new={n}` | 两个树大小间的一致性证明 |
+
+### 独立验证
+
+`app/verify.py` 提供不依赖数据库/网络的验证逻辑，仅凭预置信任公钥、
+证书、树头和证明核验包含性与历史前缀一致性；拒绝篡改、非法大小或多余节点，
+不信任响应自带公钥。
+
+演示脚本：
+
+```sh
+# 把信任的公钥（out-of-band 获取）存到文件
+curl -s http://127.0.0.1:8000/log/public-key \
+  | python -c "import sys,json; print(json.load(sys.stdin)['public_key'])" \
+  > log_pub.b64
+
+# 验证证书包含性 + 与历史大小 1 的一致性
+.venv/bin/python -m app.audit_verify \
+  --base-url http://127.0.0.1:8000 \
+  --trust-key log_pub.b64 \
+  --cert server.pem \
+  --old-size 1
+```
+
 ## ACME（RFC 8555 子集）
 
 ### 范围
@@ -293,6 +351,14 @@ openssl x509 -in demo.pem -noout -subject -ext subjectAltName -dates
 
 测试覆盖：CSR/域名/密钥策略、证书扩展与链验证、幂等与并发去重、
 吊销原因冲突、CRL 编号并发一致、重启复用，以及 CA 缺失/不匹配拒绝启动。
+
+透明度审计测试（`tests/test_audit_*.py`）覆盖：RFC 6962 叶/节点/空树
+向量、包含证明与一致性证明的生成-验证模糊测试（40 叶内全部索引）、
+篡改/非法大小/多余节点拒绝、签发追加连续叶、幂等重放不增叶、吊销保留
+历史、并发不重号不跳号、ACME 签发入日志、旧库按序列号数值升序迁移、
+迁移失败整批回滚、重启保留根与日志身份、签名密钥缺失/不匹配拒绝启动、
+审计接口（公钥、最新/历史树头、包含/一致性证明、越界拒绝）、独立验证
+逻辑拒绝篡改与非法大小，以及非 UTF-8 挑战响应返回 400 而非 500。
 
 ACME 测试（`tests/test_acme.py`）额外覆盖：目录/nonce、账号注册复用与跨账号
 隔离、JWS 签名/url/nonce 校验、nonce 过期与并发重放、POST-as-GET、

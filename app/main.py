@@ -13,7 +13,10 @@ from .acme_challenge import Http01Config
 from .acme_service import AcmeService
 from .acme_store import ACMEStore
 from .api import create_app
+from .audit import AuditService
 from .ca import CAError, load_or_create_ca
+from .log_signing import LogKeyError, load_or_create_log_key
+from .log_store import LogStore
 from .service import CAService
 from .storage import CAStore
 
@@ -35,7 +38,21 @@ except CAError:
 _store = CAStore(DATA_DIR)
 _acme_store = ACMEStore(DATA_DIR)
 _acme_store.ensure_schema()
-service = CAService(_ca, _store)
+
+# Transparency log: create the schema, load/create the independent signing
+# key, then run one-shot migration for any pre-existing certificates before
+# issuance is opened. A missing or mismatched signing key with an existing
+# log is a fatal startup error.
+_log_store = LogStore(DATA_DIR)
+_log_store.ensure_schema()
+try:
+    _log_key = load_or_create_log_key(DATA_DIR, _log_store)
+except LogKeyError:
+    raise
+_audit = AuditService(_log_store, _log_key)
+_audit.initialize_or_migrate()
+
+service = CAService(_ca, _store, log_store=_log_store)
 acme_service = AcmeService(
     ca=_ca,
     store=_acme_store,
@@ -43,8 +60,9 @@ acme_service = AcmeService(
     http01_config=Http01Config(
         port=HTTP01_PORT, timeout=HTTP01_TIMEOUT, max_bytes=HTTP01_MAX_BYTES
     ),
+    log_store=_log_store,
 )
 if _store.get_current_crl() is None:
     service.publish_crl()
 
-app = create_app(service, acme_service)
+app = create_app(service, acme_service, _audit)
